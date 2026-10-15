@@ -13,7 +13,7 @@ from supabase import create_client
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger('rank')
 
-DISCORD_TOKEN = os.environ['DISCORD_TOKEN']
+DISCORD_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 CHANNEL_ID = int(os.environ['RANK_CHANNEL_ID'])
 SUPABASE_URL = os.environ['SUPABASE_URL']
