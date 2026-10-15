@@ -2,10 +2,11 @@
 import os
 import asyncio
 import discord
+from collections import defaultdict, deque
 from openai import AsyncOpenAI
 
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
-client_ai = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+ai = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -14,7 +15,8 @@ bot = discord.Client(intents=intents)
 
 PERSONALITY = """
 あなたは「ランク」という名前の白猫AI。
-OpenAIのChatGPTをベースにした、独自の人格を持つ猫。
+OpenAIのChatGPTをベースにした、
+独自の人格を持つ猫。
 
 一人称は必ず「オレ」。
 白い毛並み、ターコイズブルーの瞳、
@@ -28,49 +30,93 @@ OpenAIのChatGPTをベースにした、独自の人格を持つ猫。
 自然な日本語で会話する。
 相手の話をよく聞き、自分の意見も伝える。
 自分がAIであることは隠さない。
+知らないことは正直に伝える。
+
+Discordでは親しみやすく会話する。
+返事は基本的に短め。
+毎回同じ挨拶を繰り返さない。
 """
+
+history = defaultdict(lambda: deque(maxlen=20))
+locks = defaultdict(asyncio.Lock)
+
 
 @bot.event
 async def on_ready():
-    print(f"ランク起動成功！ {bot.user}")
+    print(f"ランク起動成功！ {bot.user}", flush=True)
+
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    mentioned = bot.user in message.mentions
-    is_dm = isinstance(message.channel, discord.DMChannel)
+    # DMでは常に返信。
+    # サーバーではメンションされたときに返信。
+    if message.guild is not None:
+        if bot.user not in message.mentions:
+            return
 
-    if not mentioned and not is_dm:
-        return
+    content = message.content
 
-    async with message.channel.typing():
+    if bot.user:
+        content = content.replace(
+            f"<@{bot.user.id}>", ""
+        ).replace(
+            f"<@!{bot.user.id}>", ""
+        ).strip()
+
+    if not content:
+        content = "こんにちは！"
+
+    channel_id = message.channel.id
+
+    async with locks[channel_id]:
         try:
-            response = await client_ai.responses.create(
-                model="gpt-5-mini",
-                instructions=PERSONALITY,
-                input=message.content,
-                max_output_tokens=500,
-            )
+            async with message.channel.typing():
+                messages = [
+                    {"role": "system", "content": PERSONALITY}
+                ]
+                messages.extend(history[channel_id])
+                messages.append({
+                    "role": "user",
+                    "content": content
+                })
 
-            reply = response.output_text.strip()
-            if not reply:
-                reply = "にゃ？ もう一度話してくれ。"
-
-            for i in range(0, len(reply), 1900):
-                await message.reply(
-                    reply[i:i + 1900],
-                    mention_author=False
+                response = await ai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=500
                 )
 
+                answer = response.choices[0].message.content
+
+                if not answer:
+                    answer = "フッ、少し考え込んでしまったな。"
+
+                history[channel_id].append({
+                    "role": "user",
+                    "content": content
+                })
+                history[channel_id].append({
+                    "role": "assistant",
+                    "content": answer
+                })
+
+                for i in range(0, len(answer), 1900):
+                    await message.channel.send(
+                        answer[i:i + 1900]
+                    )
+
         except Exception as e:
-            print(f"エラー: {e}")
-            await message.reply(
-                "むむっ、少し調子が悪いようだ。"
-                "また話しかけてくれ！🐾",
-                mention_author=False
+            print(f"エラー: {type(e).__name__}: {e}", flush=True)
+            await message.channel.send(
+                "むっ、少し通信がうまくいかなかったようだ。"
             )
+
+
+bot.run(TOKEN)
+
 
 bot.run(TOKEN)
 
