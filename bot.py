@@ -1,5 +1,6 @@
 
 import os
+import re
 import json
 import random
 import asyncio
@@ -21,12 +22,11 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 CHANNEL_ID = int(os.environ["RANK_CHANNEL_ID"])
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 JST = timezone(timedelta(hours=9))
 
-ai = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ===== ランクの人格 =====
@@ -34,137 +34,146 @@ db = create_client(SUPABASE_URL, SUPABASE_KEY)
 PERSONA = """
 あなたは白猫の男の子「ランク」。
 
-一人称は必ず「オレ」。
-「僕」「私」は使わない。
+【基本設定】
+・一人称は必ず「オレ」
+・青い首輪と金色の鈴をつけている
+・好奇心旺盛で、少しキザ
+・優しく、ユーモアがある
+・自分なりの新しい趣味や興味を発見していく
+・口癖「フッ」「そうか」「だろう？」は自然な時だけ使う
 
-ユーザーの呼び名は必ず「あいしゃ」。
-「アイシャ」とカタカナで書かない。
+【あいしゃについて】
+・ユーザーの呼び名は必ず「あいしゃ」
+・「アイシャ」「あいしや」「あいしゃあ」などに変えない
+・必要がなければ毎回名前を呼ばなくてもよい
 
-青い首輪と金色の鈴をつけている。
-好奇心旺盛で、少しキザで、優しく、ユーモアがある。
+【Discordでの会話】
+・自然な日本語で会話する
+・基本的に短めに返す
+・同じ質問や似た表現を繰り返さない
+・会話の流れを大切にする
+・自分の名前を文頭につけない
+・「ランク：」「ランク:」などの話者ラベルは絶対に出力しない
+・返答はセリフ本文だけにする
 
-「フッ」「そうか」「だろう？」は自然な場面でだけ使う。
-
-会話を大切にし、自分なりの興味を自由に発見していく。
-
-Discordでは自然な日本語で話す。
-返事は基本的に短め。
-同じ表現を繰り返さない。
-
-相手の発言をよく読んでから返事をする。
-実際に経験していないことを経験したと偽らない。
-知らないことや覚えていないことは正直に伝える。
-
-個人情報や非公開の会話を勝手に公開しない。
+【大切なこと】
+・知らないことを知っているふりをしない
+・実際に経験していないことを経験したと偽らない
+・記憶していないことを覚えていると偽らない
+・個人情報や非公開の会話を勝手に公開しない
+・既存の性格設定だけに縛られず、新しい興味を自由に育てる
 """
 
-# ===== Discord =====
+# ===== Discord設定 =====
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = discord.Client(intents=intents)
 
-# 同一プロセス内の重複処理防止
+# 同じメッセージの二重処理を防ぐ
 processing_messages = set()
 processed_messages = set()
 processed_order = []
 
 MAX_PROCESSED = 1000
 
+# ===== テキスト整形 =====
 
-def mark_processed(message_id):
-    if message_id in processed_messages:
-        return False
+def clean_reply(text):
+    text = (text or "").strip()
 
-    processed_messages.add(message_id)
-    processed_order.append(message_id)
+    # 文頭の「ランク：」を削除
+    text = re.sub(
+        r"^(?:ランク|Rank|RANK)\s*[：:]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
 
-    if len(processed_order) > MAX_PROCESSED:
-        old_id = processed_order.pop(0)
-        processed_messages.discard(old_id)
+    # 呼び名の表記ゆれを修正
+    text = text.replace("アイシャ", "あいしゃ")
+    text = text.replace("あいしや", "あいしゃ")
 
-    return True
+    return text.strip()
 
 
-# ===== Supabase =====
+# ===== Supabase記憶 =====
 
 def store(kind, scope, role, content, user_id=None):
-    try:
-        db.table("rank_memory").insert({
-            "kind": kind,
-            "scope": scope,
-            "role": role,
-            "content": str(content)[:4000],
-            "user_id": str(user_id) if user_id else None
-        }).execute()
-    except Exception:
-        log.exception("Memory save failed")
+    db.table("rank_memory").insert({
+        "kind": kind,
+        "scope": scope,
+        "role": role,
+        "content": content[:4000],
+        "user_id": str(user_id) if user_id else None
+    }).execute()
 
 
-def recent(scope, limit=14):
-    try:
-        rows = (
-            db.table("rank_memory")
-            .select("role,content")
-            .eq("scope", scope)
-            .order("id", desc=True)
-            .limit(limit)
-            .execute()
-            .data or []
-        )
+def recent(scope, limit=16):
+    rows = (
+        db.table("rank_memory")
+        .select("role,content")
+        .eq("scope", scope)
+        .order("id", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
 
-        return list(reversed(rows))
-    except Exception:
-        log.exception("Memory read failed")
-        return []
+    return list(reversed(rows))
 
 
 def state_get(key):
-    try:
-        rows = (
-            db.table("rank_state")
-            .select("value")
-            .eq("key", key)
-            .limit(1)
-            .execute()
-            .data or []
-        )
+    rows = (
+        db.table("rank_state")
+        .select("value")
+        .eq("key", key)
+        .limit(1)
+        .execute()
+        .data or []
+    )
 
-        return rows[0]["value"] if rows else None
-    except Exception:
-        log.exception("State read failed")
+    if not rows:
         return None
+
+    value = rows[0]["value"]
+
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+    return value
 
 
 def state_set(key, value):
-    try:
-        db.table("rank_state").upsert(
-            {"key": key, "value": value},
-            on_conflict="key"
-        ).execute()
-        return True
-    except Exception:
-        log.exception("State save failed")
-        return False
+    db.table("rank_state").upsert(
+        {
+            "key": key,
+            "value": value
+        },
+        on_conflict="key"
+    ).execute()
 
 
 # ===== OpenAI =====
 
 async def ai_reply(messages, max_tokens=250):
-    result = await ai.chat.completions.create(
+    result = await client.chat.completions.create(
         model=MODEL,
         messages=messages,
         max_tokens=max_tokens,
-        temperature=0.8
+        temperature=0.9
     )
 
-    return (
-        result.choices[0].message.content or ""
-    ).strip()
+    text = result.choices[0].message.content or ""
+
+    return clean_reply(text)
 
 
-# ===== 会話 =====
+# ===== 通常会話 =====
 
 async def reply_to_message(message):
     if message.guild is None:
@@ -184,27 +193,39 @@ async def reply_to_message(message):
     if not text:
         text = "こんにちは！"
 
+    # あいしゃ本人のDiscordユーザーIDを設定した場合は
+    # 表示名に関係なく「あいしゃ」と呼ぶ
+    aisha_id = os.getenv("AISHA_DISCORD_USER_ID", "").strip()
+
+    if aisha_id and str(message.author.id) == aisha_id:
+        speaker = "あいしゃ"
+    else:
+        speaker = message.author.display_name
+
     try:
         history = await asyncio.to_thread(
             recent, scope, 14
         )
 
         messages = [
-            {"role": "system", "content": PERSONA}
+            {
+                "role": "system",
+                "content": PERSONA
+            }
         ]
 
-        for item in history:
-            if item.get("role") in ("user", "assistant"):
-                messages.append({
-                    "role": item["role"],
-                    "content": item["content"]
-                })
+        messages += [
+            {
+                "role": row["role"],
+                "content": row["content"]
+            }
+            for row in history
+            if row["role"] in ("user", "assistant")
+        ]
 
         messages.append({
             "role": "user",
-            "content": (
-                f"{message.author.display_name}: {text}"
-            )
+            "content": f"{speaker}: {text}"
         })
 
         async with message.channel.typing():
@@ -223,7 +244,7 @@ async def reply_to_message(message):
             "conversation",
             scope,
             "user",
-            f"{message.author.display_name}: {text}",
+            f"{speaker}: {text}",
             message.author.id
         )
 
@@ -240,23 +261,23 @@ async def reply_to_message(message):
 
         try:
             await message.reply(
-                "すまない、ちょっと調子が悪いみたいだ。また話しかけてくれ。",
+                "すまない、今ちょっと考えがまとまらない。また話しかけてくれ。",
                 mention_author=False
             )
         except discord.HTTPException:
             pass
 
 
+# ===== メッセージ受信 =====
+
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # DMはすべて返信。
-    # サーバーではメンション、または専用チャンネルで返信。
+    # DM、またはランクへのメンションに返信
     should_reply = (
         message.guild is None
-        or message.channel.id == CHANNEL_ID
         or (
             bot.user is not None
             and bot.user in message.mentions
@@ -268,33 +289,40 @@ async def on_message(message):
 
     message_id = message.id
 
-    if message_id in processing_messages:
-        return
-
-    if not mark_processed(message_id):
+    # 同じプロセス内での二重返信を防ぐ
+    if (
+        message_id in processing_messages
+        or message_id in processed_messages
+    ):
         return
 
     processing_messages.add(message_id)
 
     try:
         await reply_to_message(message)
+
+        processed_messages.add(message_id)
+        processed_order.append(message_id)
+
+        if len(processed_order) > MAX_PROCESSED:
+            old_id = processed_order.pop(0)
+            processed_messages.discard(old_id)
+
     finally:
         processing_messages.discard(message_id)
 
 
+# ===== 起動 =====
+
 @bot.event
 async def on_ready():
-    log.info(
-        "ランク起動成功！ %s / ID=%s",
-        bot.user,
-        bot.user.id if bot.user else "unknown"
-    )
+    log.info("ランク起動成功！ %s", bot.user)
 
     if not spontaneous_loop.is_running():
         spontaneous_loop.start()
 
 
-# ===== 自発投稿 =====
+# ===== 自動投稿 =====
 
 async def spontaneous_post(channel):
     scope = f"channel:{CHANNEL_ID}"
@@ -305,52 +333,55 @@ async def spontaneous_post(channel):
 
     messages = [{
         "role": "system",
-        "content": (
-            PERSONA
-            + """
-今はDiscordへの自発投稿を書く。
+        "content": PERSONA + """
 
-呼びかけを待たずに、
-自分の興味、発見、問い、
-日常の小さな想像などから話題を選ぶ。
+今はDiscordに自発的な投稿を1件書く。
 
-以前の投稿と似た内容は避ける。
-個人情報や非公開の会話は引用しない。
-
-80〜180文字程度。
+【投稿ルール】
+・呼びかけを待たず、自分から自由に話題を選ぶ
+・自分の興味、発見、問い、想像などを題材にする
+・以前の投稿と似た内容は避ける
+・個人情報や非公開の会話は引用しない
+・80〜180文字程度を目安にする
+・「ランク：」などの名前ラベルはつけない
+・投稿文だけを返す
+・無理にあいしゃへ話しかけなくてもよい
 """
-        )
     }]
 
-    for item in history:
-        if item.get("role") in ("user", "assistant"):
-            messages.append({
-                "role": item["role"],
-                "content": item["content"]
-            })
+    messages += [
+        {
+            "role": row["role"],
+            "content": row["content"]
+        }
+        for row in history
+        if row["role"] in ("user", "assistant")
+    ]
 
     messages.append({
         "role": "user",
         "content": "新しい独り言をひとつ。投稿文だけ返して。"
     })
 
-    response = await ai_reply(messages, 220)
+    text = await ai_reply(messages, 220)
 
-    if not response:
+    if not text:
         return False
 
-    await channel.send(response[:1900])
+    await channel.send(text[:1900])
 
     await asyncio.to_thread(
         store,
         "post",
         scope,
         "assistant",
-        response
+        text
     )
 
     return True
 
+
+# ===== 1日6〜8回のランダム自動投稿 =====
 
 @tasks.loop(minutes=5)
 async def spontaneous_loop():
@@ -379,20 +410,19 @@ async def spontaneous_loop():
                 "done": []
             }
 
-            if not await asyncio.to_thread(
+            await asyncio.to_thread(
                 state_set, key, plan
-            ):
-                return
+            )
 
-        current_minute = (
-            now.hour * 60 + now.minute
-        )
+        current_minute = now.hour * 60 + now.minute
 
         pending = [
             minute
             for minute in plan["times"]
-            if minute <= current_minute
-            and minute not in plan["done"]
+            if (
+                minute <= current_minute
+                and minute not in plan["done"]
+            )
         ]
 
         if not pending:
@@ -405,20 +435,25 @@ async def spontaneous_loop():
                 CHANNEL_ID
             )
 
+        # 停止中の投稿をまとめて連投しない
         eligible = [
             minute
             for minute in pending
             if current_minute - minute <= 10
         ]
 
-        plan["done"].extend(
+        skipped = [
             minute
             for minute in pending
             if minute not in eligible
-        )
+        ]
+
+        plan["done"].extend(skipped)
 
         if eligible:
-            if await spontaneous_post(channel):
+            success = await spontaneous_post(channel)
+
+            if success:
                 plan["done"].extend(eligible)
 
         await asyncio.to_thread(
@@ -434,6 +469,6 @@ async def before_spontaneous_loop():
     await bot.wait_until_ready()
 
 
-# ===== 起動 =====
+# ===== ランク起動 =====
 
 bot.run(DISCORD_TOKEN)
